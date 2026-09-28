@@ -146,18 +146,31 @@ export async function submitBountyPR(
     ? plan.headBranch
     : `${headFull}:${plan.headBranch}`;
 
-  const created = await github<PullRequest>(token, `/repos/${baseFull}/pulls`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title: plan.title,
-      body: plan.body,
-      head,
-      base: plan.baseBranch,
-      maintainer_can_modify: true,
-      draft: false,
-    }),
-  });
+  try {
+    const created = await github<PullRequest>(token, `/repos/${baseFull}/pulls`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: plan.title,
+        body: plan.body,
+        head,
+        base: plan.baseBranch,
+        maintainer_can_modify: true,
+        draft: false,
+      }),
+    });
 
-  return { status: "created", prNumber: created.number, url: created.html_url };
+    return { status: "created", prNumber: created.number, url: created.html_url };
+  } catch (error) {
+    // A concurrent worker may have created the PR between preflight and POST.
+    // Re-query before declaring the bounty submission blocked.
+    const existing = await github<PullRequest[]>(
+      token,
+      `/repos/${baseFull}/pulls?state=open&base=${encodeURIComponent(plan.baseBranch)}&head=${encodeURIComponent(head)}&per_page=10`,
+    );
+    if (existing.length > 0) {
+      return { status: "existing", prNumber: existing[0].number, url: existing[0].html_url };
+    }
+    return { status: "blocked", reason: `PR creation failed: ${String(error)}` };
+  }
 }
