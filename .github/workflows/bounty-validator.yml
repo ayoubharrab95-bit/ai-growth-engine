@@ -3,8 +3,6 @@ name: Bounty PR Preflight
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  pull_request_review:
-    types: [submitted]
 
 permissions:
   contents: read
@@ -18,7 +16,7 @@ concurrency:
 jobs:
   preflight:
     name: Safe PR preflight
-    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact PR head
