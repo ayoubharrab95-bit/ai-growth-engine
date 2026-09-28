@@ -3,8 +3,6 @@ name: Bounty PR Preflight
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  pull_request_target:
-    types: [opened, synchronize, reopened]
   pull_request_review:
     types: [submitted]
 
@@ -93,6 +91,7 @@ jobs:
           fi
 
       - name: Run project tests
+        id: tests
         if: steps.preflight.outputs.result == 'pass'
         shell: bash
         run: |
@@ -133,23 +132,3 @@ jobs:
             BODY="❌ **PR Preflight blocked this submission.** ${REASON:-Preflight did not complete.} Fix the reported issue and push again."
           fi
           gh pr comment "$PR_NUMBER" --body "$BODY"
-
-  payout-notify:
-    name: Notify payout after merge
-    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved' && github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Notify bounty executor
-        env:
-          SUPABASE_URL: https://kjtirbnxxymeumycrhqv.supabase.co
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          ISSUE_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          CONTRIBUTOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          set -euo pipefail
-          echo "Merged PR detected. Payout notification is delegated to the existing bounty executor."
-          # Intentionally no wallet signing or payment is performed here.
