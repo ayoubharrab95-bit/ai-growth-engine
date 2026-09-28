@@ -122,9 +122,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RESULT: ${{ steps.preflight.outputs.result }}
           REASON: ${{ steps.preflight.outputs.reason }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
         run: |
           set -euo pipefail
-          if [[ "$RESULT" == "pass" ]]; then
+          if [[ "$RESULT" == "pass" && "$TEST_OUTCOME" != "failure" ]]; then
             BODY="✅ **PR Preflight passed.** $REASON\n\nTests completed without being suppressed. This workflow does **not** auto-approve or auto-merge the PR."
           else
             BODY="❌ **PR Preflight blocked this submission.** ${REASON:-Preflight did not complete.} Fix the reported issue and push again."
