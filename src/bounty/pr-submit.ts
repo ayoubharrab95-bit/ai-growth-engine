@@ -73,7 +73,7 @@ function validName(value: string): boolean {
 }
 
 function validBranch(value: string): boolean {
-  return value.length > 0 && value.length <= 255 && !/[\\s~^:?*\\[\\]]/.test(value);
+  return value.length > 0 && value.length <= 255 && !/[\s~^:?*\[\]]/.test(value);
 }
 
 export async function planSubmission(
