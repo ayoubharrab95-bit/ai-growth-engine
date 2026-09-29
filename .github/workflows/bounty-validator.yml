@@ -1,136 +1,133 @@
-name: Autonomous Bounty Validator
+name: Bounty PR Preflight
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  pull_request_review:
-    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: bounty-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
+  preflight:
+    name: Safe PR preflight
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-
     steps:
-      - name: Checkout PR
+      - name: Checkout exact PR head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Detect linked bounty issue
-        id: detect
+      - name: Fetch base commit
+        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+
+      - name: Validate PR metadata and changed files
+        id: preflight
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        shell: bash
         run: |
-          ISSUE=$(echo "$PR_BODY $PR_TITLE" | grep -oP '(?<=#)\d+' | head -1)
-          echo "issue_number=$ISSUE" >> $GITHUB_OUTPUT
-          echo "Linked issue: $ISSUE"
+          set -euo pipefail
 
-      - name: Check changed files exist and are non-empty
-        id: file_check
-        run: |
-          FILES=$(git diff --name-only origin/main HEAD)
-          echo "Changed files: $FILES"
-          EMPTY=0
-          for f in $FILES; do
-            if [ -f "$f" ] && [ ! -s "$f" ]; then
-              echo "EMPTY FILE: $f"
-              EMPTY=1
+          fail() {
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            echo "::error::$1"
+            exit 0
+          }
+
+          [[ "$HEAD_REF" != "main" && "$HEAD_REF" != "master" ]] || fail "PR must use a dedicated feature branch."
+
+          ISSUE_NUMBER="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)"
+          [[ -n "$ISSUE_NUMBER" ]] || fail "No linked issue found. Reference the bounty issue as #N or use 'closes #N'."
+
+          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$BASE_REPO" --json state,labels,title 2>/dev/null || true)"
+          [[ -n "$ISSUE_JSON" ]] || fail "Linked issue #$ISSUE_NUMBER could not be read."
+          ISSUE_STATE="$(printf '%s' "$ISSUE_JSON" | jq -r '.state')"
+          [[ "$ISSUE_STATE" == "OPEN" ]] || fail "Linked issue #$ISSUE_NUMBER is not open."
+
+          mapfile -t FILES < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          [[ "${#FILES[@]}" -gt 0 ]] || fail "PR contains no file changes."
+
+          for file in "${FILES[@]}"; do
+            if [[ -f "$file" && ! -s "$file" ]]; then
+              fail "PR contains an empty file: $file"
             fi
           done
-          echo "empty_files=$EMPTY" >> $GITHUB_OUTPUT
 
-      - name: Run tests if present
+          {
+            echo "result=pass"
+            echo "reason=Preflight passed for issue #$ISSUE_NUMBER (${#FILES[@]} changed files)."
+            echo "issue_number=$ISSUE_NUMBER"
+            echo "head_repo=$HEAD_REPO"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        if: steps.preflight.outputs.result == 'pass'
+        shell: bash
         run: |
-          if [ -f "package.json" ]; then
-            npm ci --quiet 2>/dev/null || true
-            npm test 2>&1 | tail -20 || true
-          fi
-          if ls tests/*.test.ts 2>/dev/null; then
-            deno test tests/ 2>&1 | tail -20 || true
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci --ignore-scripts
+          elif [[ -f package.json ]]; then
+            npm install --ignore-scripts
           fi
 
-      - name: Validate acceptance criteria
-        id: validate
+      - name: Run project tests
+        id: tests
+        if: steps.preflight.outputs.result == 'pass'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TESTED=0
+
+          if [[ -f package.json ]]; then
+            if node -e 'const p=require("./package.json"); process.exit(p.scripts?.test ? 0 : 1)' 2>/dev/null; then
+              npm test
+              TESTED=1
+            fi
+          fi
+
+          if [[ -f deno.json || -f deno.jsonc ]]; then
+            if compgen -G "tests/**/*.test.ts" > /dev/null || compgen -G "tests/*.test.ts" > /dev/null; then
+              deno test --allow-env --allow-net tests/
+              TESTED=1
+            fi
+          fi
+
+          echo "Test suites executed: $TESTED"
+          if [[ "$TESTED" -eq 0 ]]; then
+            echo "No configured test suite found; continuing with structural preflight."
+          fi
+
+      - name: Comment preflight result
+        if: always()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ steps.detect.outputs.issue_number }}
-          REPO: ${{ github.repository }}
-          EMPTY_FILES: ${{ steps.file_check.outputs.empty_files }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RESULT: ${{ steps.preflight.outputs.result }}
+          REASON: ${{ steps.preflight.outputs.reason }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
         run: |
-          if [ "$EMPTY_FILES" = "1" ]; then
-            echo "result=fail" >> $GITHUB_OUTPUT
-            echo "reason=PR contains empty files" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          ADDITIONS=$(git diff --stat origin/main HEAD | tail -1 | grep -oP '\d+ insertion' | grep -oP '\d+' || echo 0)
-          if [ "${ADDITIONS:-0}" -lt 10 ]; then
-            echo "result=fail" >> $GITHUB_OUTPUT
-            echo "reason=Too few meaningful changes (${ADDITIONS} lines added)" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [[ "$RESULT" == "pass" && "$TEST_OUTCOME" != "failure" ]]; then
+            BODY="✅ **PR Preflight passed.** $REASON\n\nTests completed without being suppressed. This workflow does **not** auto-approve or auto-merge the PR."
           else
-            echo "result=pass" >> $GITHUB_OUTPUT
-            echo "reason=Validation passed: ${ADDITIONS} lines added" >> $GITHUB_OUTPUT
+            BODY="❌ **PR Preflight blocked this submission.** ${REASON:-Preflight did not complete.} Fix the reported issue and push again."
           fi
-
-      - name: Comment validation result
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RESULT: ${{ steps.validate.outputs.result }}
-          REASON: ${{ steps.validate.outputs.reason }}
-          REPO: ${{ github.repository }}
-        run: |
-          if [ "$RESULT" = "pass" ]; then
-            BODY="✅ **Autonomous Validator**: PR passed. Auto-merging and logging bounty payment..."
-          else
-            BODY="❌ **Autonomous Validator**: $REASON. Please fix and push again."
-          fi
-          curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "{\"body\": \"$BODY\"}"
-
-      - name: Auto-approve and merge if valid
-        if: steps.validate.outputs.result == 'pass'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
-            -d '{"event": "APPROVE", "body": "✅ Auto-approved by Autonomous Validator"}'
-          sleep 3
-          curl -s -X PUT -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/merge" \
-            -d "{\"merge_method\": \"squash\", \"commit_title\": \"Auto-merge: PR #$PR_NUMBER (bounty validated)\", \"sha\": \"$HEAD_SHA\"}"
-
-      - name: Notify Supabase bounty-executor
-        if: steps.validate.outputs.result == 'pass'
-        env:
-          SUPABASE_URL: https://kjtirbnxxymeumycrhqv.supabase.co
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          ISSUE_NUMBER: ${{ steps.detect.outputs.issue_number }}
-          REPO: ${{ github.repository }}
-          CONTRIBUTOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          curl -s -X POST "$SUPABASE_URL/functions/v1/github-webhook" \
-            -H "Content-Type: application/json" \
-            -H "x-github-event: bounty_validated" \
-            -d "{
-              \"action\": \"bounty_validated\",
-              \"pr_number\": $PR_NUMBER,
-              \"issue_number\": \"$ISSUE_NUMBER\",
-              \"repo\": \"$REPO\",
-              \"contributor\": \"$CONTRIBUTOR\",
-              \"validated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-            }"
+          gh pr comment "$PR_NUMBER" --body "$BODY"
